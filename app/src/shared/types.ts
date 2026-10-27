@@ -42,6 +42,8 @@ export interface Item {
   title: string
   /** background written for the user to recall the item by */
   context?: string
+  /** The user's own remark, written in the app; agents read it (mana-track show) but never write it */
+  remark?: string
   status: PointStatus
   created_at: string
   updated_at: string

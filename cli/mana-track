@@ -483,6 +483,15 @@ def cmd_new(a):
 def cmd_point(a):
     with locked():
         item = load(a.id)
+        # A point on an accepted item reopens it. The user scans titles, so the title has to say
+        # why it is back — otherwise the reopened item looks like the one they already signed off.
+        if item['status'] == 'accepted' and not item.get('title_locked') and (not a.title or a.title == item['title']):
+            sys.exit(f'#{a.id} is accepted; a new point reopens it. Pass --title with a title that names '
+                     f'the new problem (now: {item["title"]})')
+        if a.title:
+            if item.get('title_locked'):
+                sys.exit(f'#{a.id} has a title the user renamed in the app; it cannot be changed')
+            item['title'] = a.title
         at = now()
         pid = max((p['id'] for p in item['points']), default=0) + 1
         item['points'].append({'id': pid, 'text': a.text, 'status': 'open', 'note': '', 'images': [],
@@ -492,7 +501,7 @@ def cmd_point(a):
         updated = set_context(item, a.context)
         touch_session(item)
         log(item, f'added point {pid}' + (' with images' if a.with_images else '')
-            + (', context updated' if updated else ''))
+            + (', title changed' if a.title else '') + (', context updated' if updated else ''))
         save(item)
     print(f'#{a.id} point {pid} added')
 
@@ -803,6 +812,10 @@ def cmd_show(a):
         print('\n  context:')
         for line in item['context'].splitlines():
             print(f'    {line}')
+    if item.get('remark'):
+        print('\n  user remark (written by the user in the app):')
+        for line in item['remark'].splitlines():
+            print(f'    {line}')
     for p in item['points']:
         print(f'\n  point {p["id"]} [{p["status"]}] {p["created_at"][:16]}')
         for line in p['text'].splitlines():
@@ -878,6 +891,7 @@ def main():
     p.add_argument('text')
     p.add_argument('--with-images', action='store_true', help="attach the images from the user's latest message")
     p.add_argument('--context', help='full updated background, when a decision or direction changed')
+    p.add_argument('--title', help='retitle when the old title no longer covers the item; required on an accepted item')
     p.set_defaults(fn=cmd_point)
 
     p = sub.add_parser('image', help='attach images the user pasted earlier to a point')

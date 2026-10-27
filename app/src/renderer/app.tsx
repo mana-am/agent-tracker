@@ -1,8 +1,8 @@
 // The user's side of the list: accept, jump back into the agent's conversation, set priority,
-// rename. Everything else ("still wrong", "drop it", new points) is said in the conversation and
+// rename, write a remark, and mark cards during a review pass. Everything else ("still wrong", "drop it", new points) is said in the conversation and
 // written by the agent through cli/mana-track.
-import { ArrowUpRight, Bug, Check, ChevronDown, ChevronLeft, ChevronRight, FolderOpen, Tag, Lightbulb, MessageSquareOff, Search, Undo2, X } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { ArrowUpRight, BookmarkCheck, Bug, Check, ChevronDown, ChevronLeft, ChevronRight, FolderOpen, Tag, Lightbulb, MessageSquareOff, Search, StickyNote, Undo2, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { AppInfo, Item, Point, PointStatus, Priority, Workspaces } from '../shared/types'
 import { api } from './api'
@@ -59,6 +59,40 @@ function workspaceTitle(item: Item, ws: Workspaces) {
   return ''
 }
 
+// Marks are a review pass's scratch state ("looked at this one"), not item data: they live in
+// this app only, per project (item ids restart at #1 in each), survive a restart, and are cleared
+// from the toolbar when the pass is over.
+function useMarks(project: string) {
+  const key = `marked-items:${project}`
+  const [marks, setMarks] = useState<Set<number>>(new Set())
+  useEffect(() => {
+    try {
+      setMarks(new Set(JSON.parse(localStorage.getItem(key) ?? '[]')))
+    } catch {
+      setMarks(new Set())
+    }
+  }, [key])
+  const update = useCallback(
+    (fn: (cur: Set<number>) => Set<number>) =>
+      setMarks((cur) => {
+        const next = fn(cur)
+        localStorage.setItem(key, JSON.stringify([...next]))
+        return next
+      }),
+    [key],
+  )
+  const toggle = useCallback(
+    (id: number) =>
+      update((cur) => {
+        const next = new Set(cur)
+        if (!next.delete(id)) next.add(id)
+        return next
+      }),
+    [update],
+  )
+  return { marks, toggle, clear: () => update(() => new Set()) }
+}
+
 function App() {
   const [items, setItems] = useState<Item[]>([])
   const [info, setInfo] = useState<AppInfo | null>(null)
@@ -74,6 +108,7 @@ function App() {
   const [zoom, setZoom] = useState<{ srcs: string[]; index: number } | null>(null)
   const [skips, setSkips] = useState<Skip[]>([])
   const [showSkips, setShowSkips] = useState(false)
+  const { marks, toggle: toggleMark, clear: clearMarks } = useMarks(info?.root ?? '')
 
   useEffect(() => {
     const applyInfo = (i: AppInfo) => {
@@ -108,6 +143,8 @@ function App() {
       .filter((i) => !platformFilter || platforms(i).includes(platformFilter))
       .sort(SORTS[sort])
   }, [items, ws, typeFilter, q, priorities, tagFilter, platformFilter, sort])
+  // Only marks on items that still exist count; one whose item was merged away just lingers unseen.
+  const markCount = useMemo(() => items.filter((i) => marks.has(i.id)).length, [items, marks])
   const tagCounts = useMemo(() => {
     const c = new Map<string, number>()
     for (const i of items) for (const tag of i.tags ?? []) c.set(tag, (c.get(tag) ?? 0) + 1)
@@ -234,6 +271,12 @@ function App() {
             ))}
           </div>
           <span className="spacer" />
+          {markCount > 0 && (
+            <button className="btn plain mark-clear" onClick={clearMarks} title={t.clearMarksHint}>
+              <BookmarkCheck size={13} />
+              {t.clearMarks(markCount)}
+            </button>
+          )}
           <select className="sort-select" value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
             {(Object.keys(SORTS) as SortKey[]).map((k) => (
               <option key={k} value={k}>
@@ -268,6 +311,8 @@ function App() {
                 imgUrl={imgUrl}
                 showStatus={mixed}
                 byCreated={sort === 'created_desc' || sort === 'created_asc'}
+                marked={marks.has(i.id)}
+                onToggleMark={toggleMark}
                 onZoom={onZoom}
               />
             ))}
@@ -312,11 +357,14 @@ function Card(props: {
   imgUrl: (rel: string) => string
   showStatus: boolean
   byCreated: boolean
+  marked: boolean
+  onToggleMark: (id: number) => void
   onZoom: Zoom
 }) {
   const { item: i, ws } = props
   // The thread (every point) starts collapsed; the first message always shows under the title.
   const [showLog, setShowLog] = useState(false)
+  const [editingRemark, setEditingRemark] = useState(false)
   const reviewIds = i.points.filter((p) => p.status === 'review').map((p) => p.id)
   // One button per card: accepted → un-accept; otherwise accept every point not yet accepted
   // (whatever its state).
@@ -335,14 +383,28 @@ function Card(props: {
   const session = i.sessions[i.sessions.length - 1]
   const wsTitle = workspaceTitle(i, ws)
 
+  // A click anywhere on the card toggles its mark, except on the things that already do something
+  // on click (buttons, images, the title's double-click rename, the remark) or a drag that selected text.
+  const onCardClick = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest('button, input, textarea, select, a, img, .card-title, .remark')) return
+    if (window.getSelection()?.toString()) return
+    props.onToggleMark(i.id)
+  }
+
   return (
-    <article className={`card t-${i.type}`}>
+    <article className={`card t-${i.type} ${props.marked ? 'marked' : ''}`} onClick={onCardClick}>
       <div className="card-head">
         <span className={`type-icon t-${i.type}`} title={t.type[i.type]}>
           {i.type === 'bug' ? <Bug size={13} /> : <Lightbulb size={13} />}
         </span>
         <EditableTitle item={i} />
         <span className="card-when">
+          {props.marked && (
+            <span className="mark-badge">
+              <BookmarkCheck size={12} />
+              {t.marked}
+            </span>
+          )}
           {props.showStatus && <span className={`card-status s-${i.status}`}>{t.status[i.status]}</span>}
           <span title={props.byCreated ? t.createdAt : t.updatedAt}>{ago(props.byCreated ? i.created_at : i.updated_at)}</span>
         </span>
@@ -363,6 +425,16 @@ function Card(props: {
       </div>
       {i.points[0] && <div className="card-quote">{i.points[0].text}</div>}
       {i.context && <div className={`card-context ${showLog ? 'full' : ''}`}>{i.context}</div>}
+      {editingRemark ? (
+        <RemarkEditor item={i} onDone={() => setEditingRemark(false)} />
+      ) : (
+        i.remark && (
+          <div className="remark" title={t.remarkEdit} onClick={() => setEditingRemark(true)}>
+            <StickyNote size={13} />
+            <span>{i.remark}</span>
+          </div>
+        )
+      )}
       {showLog && (
         <ol className="timeline">
           {i.points.map((p) => (
@@ -395,6 +467,12 @@ function Card(props: {
           </button>
         )}
         <span className="spacer" />
+        {!i.remark && !editingRemark && (
+          <button className="btn plain small" onClick={() => setEditingRemark(true)} title={t.remarkHint}>
+            <StickyNote size={13} />
+            {t.remark}
+          </button>
+        )}
         <div className="prio-seg" title={t.priorityHint}>
           {PRIORITIES.map((p) => (
             <button
@@ -424,6 +502,35 @@ function Card(props: {
         )}
       </div>
     </article>
+  )
+}
+
+// Blur or ⌘↩ saves, Esc cancels; Enter alone is a new line. Saving it empty deletes the remark.
+function RemarkEditor({ item, onDone }: { item: Item; onDone: () => void }) {
+  const [value, setValue] = useState(item.remark ?? '')
+  // Esc and ⌘↩ unmount the textarea, which can fire one more blur: finish exactly once.
+  const finished = useRef(false)
+  const finish = (keep: boolean) => {
+    if (finished.current) return
+    finished.current = true
+    onDone()
+    if (keep && value.trim() !== (item.remark ?? '')) void api.invoke('setRemark', item.id, value)
+  }
+  return (
+    <textarea
+      className="remark remark-input"
+      autoFocus
+      rows={Math.min(Math.max(value.split('\n').length, 2), 8)}
+      value={value}
+      placeholder={t.remarkPlaceholder}
+      onChange={(e) => setValue(e.target.value)}
+      onFocus={(e) => e.target.setSelectionRange(e.target.value.length, e.target.value.length)}
+      onBlur={() => finish(true)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && e.metaKey) finish(true)
+        if (e.key === 'Escape') finish(false)
+      }}
+    />
   )
 }
 

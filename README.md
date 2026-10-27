@@ -149,6 +149,8 @@ Expand **Thread** on a card to see every point you raised, the screenshots you p
 - **Thread** — every point you raised, with screenshots and the agent's notes.
 - **Open conversation** — jumps back into the session that worked on it.
 - **Double-click a title** to rename it; the agent can no longer change it.
+- **Remark** — jot a note on an item (blur or ⌘↩ saves, Esc cancels, empty deletes). The agent sees it in `mana-track show`; writing one doesn't reorder the list.
+- **Marks** — click a card's empty space to mark it (yellow ring), click again to unmark; **Clear N marks** in the toolbar wipes them all. For going through everything in one pass. Stored in the app per project, kept across restarts.
 - **Skipped N** — turns the agent judged "not a requirement", with its reasons.
 
 ### 5. Commands

@@ -112,13 +112,14 @@ function readSkips() {
   }
 }
 
-function mutate(id: number, fn: (item: Item, at: string) => void) {
+// `touch: false` keeps updated_at, so the card stays where it is under "Updated".
+function mutate(id: number, fn: (item: Item, at: string) => void, touch = true) {
   const file = itemPath(id)
   const item: Item = JSON.parse(readFileSync(file, 'utf8'))
   const at = now()
   fn(item, at)
   item.status = deriveStatus(item)
-  item.updated_at = at
+  if (touch) item.updated_at = at
   writeJson(file, item)
   pushItems()
 }
@@ -269,6 +270,19 @@ ipcMain.handle('setTitle', (_e, id: number, title: string) =>
     item.title_locked = true
     log(item, at, `renamed: ${title}`)
   }),
+)
+
+ipcMain.handle('setRemark', (_e, id: number, remark: string) =>
+  mutate(
+    id,
+    (item, at) => {
+      const text = remark.trim()
+      if (text) item.remark = text
+      else delete item.remark
+      log(item, at, text ? `remark: ${text}` : 'remark removed')
+    },
+    false,
+  ),
 )
 
 ipcMain.handle('setPriority', (_e, id: number, priority: Priority) =>

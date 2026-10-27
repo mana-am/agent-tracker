@@ -24,6 +24,7 @@
   --c-dropped: #5c5c61;
   --c-bug: #ff6b62;
   --c-feature: #b294ff;
+  --c-mark: #ffd60a;
   --sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', sans-serif;
   --mono: ui-monospace, 'SF Mono', Menlo, monospace;
   color-scheme: dark;
@@ -225,6 +226,27 @@ input, textarea { font: inherit; color: var(--text); background: none; border: 0
   transition: background 0.12s, box-shadow 0.12s;
 }
 .card:hover { background: var(--card-hover); box-shadow: 0 0 0 1px var(--line-strong), 0 6px 18px rgba(0, 0, 0, 0.3); }
+/* marked during a review pass: a yellow ring that survives hover */
+.card.marked, .card.marked:hover { box-shadow: 0 0 0 1.5px var(--c-mark), 0 1px 3px rgba(0, 0, 0, 0.25); }
+.mark-badge { display: inline-flex; align-items: center; gap: 3px; font-weight: 600; color: var(--c-mark); }
+.mark-clear { color: var(--c-mark); }
+/* the user's own remark: their handwriting, so it reads as a sticky note rather than agent text */
+.remark {
+  display: flex;
+  gap: 7px;
+  margin-top: 9px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text);
+  background: color-mix(in srgb, var(--c-mark) 10%, transparent);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.remark svg { margin-top: 3px; color: var(--c-mark); }
+.remark:hover { background: color-mix(in srgb, var(--c-mark) 15%, transparent); }
+.remark-input { display: block; width: 100%; resize: none; box-shadow: 0 0 0 1.5px var(--c-mark); }
 
 .card-head { display: flex; align-items: flex-start; gap: 8px; }
 .type-icon {

@@ -32,6 +32,13 @@ const zh = {
   unaccept: '取消通过',
   renameHint: '双击修改标题',
   noNote: '（没写说明）',
+  remark: '备注',
+  remarkHint: '给这一条写个备注',
+  remarkEdit: '点击修改备注',
+  remarkPlaceholder: '写点备注，只有你和 agent 看得到',
+  marked: '已标记',
+  clearMarks: (n: number) => `取消全部标记 ${n}`,
+  clearMarksHint: '把所有卡片的标记一次清掉',
 }
 
 const en: typeof zh = {
@@ -64,6 +71,13 @@ const en: typeof zh = {
   unaccept: 'Un-accept',
   renameHint: 'Double-click to rename',
   noNote: '(no note)',
+  remark: 'Remark',
+  remarkHint: 'Write a remark on this item',
+  remarkEdit: 'Click to edit the remark',
+  remarkPlaceholder: 'A remark only you and the agent see',
+  marked: 'Marked',
+  clearMarks: (n: number) => `Clear ${n} marks`,
+  clearMarksHint: 'Clear the mark on every card',
 }
 
 export let t = zh

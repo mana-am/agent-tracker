@@ -8,8 +8,11 @@ description: "Keep the user's requirement & bug list with the `mana-track` CLI: 
 The user raises problems and requests; keeping the list is your job — creating items, splitting
 them sensibly, moving their status. The user reviews in the Mana Tracker app (macOS), where they
 only do a few things: accept an item, jump back into your conversation, set priority, rename a
-title. Everything else — "still wrong", "drop it", new details — they say to you in the
-conversation. The app reads `<project>/.mana-tracker/items/` live.
+title, write a **remark** on an item, and mark cards while they review (marks live in the app
+only; you never see them). Everything else — "still wrong", "drop it", new details — they say to
+you in the conversation. A remark shows in `mana-track show` as "user remark": read it before
+working on an item, it may hold instructions for you. It is the user's; no command changes it.
+The app reads `<project>/.mana-tracker/items/` live.
 
 The command is `mana-track` (on PATH). Never edit files under `.mana-tracker/items/` or
 `attachments/` directly; the hook refuses it.
@@ -144,6 +147,8 @@ the paywall? it should open the credits page" — record it.
   - good: "Post page: bottom bar bounces twice after collapsing when opening someone else's post"
   - bad: "Fix animation issue", "Post page bar jank", "some numbers in a list don't animate" (which list?)
   - A title the user renamed in the app is locked; don't try to change it.
+  - **When you add a point, check the title still covers the item.** If the new point is another change on the same screen (an item about "waveform progress bar" gains "move the play button to the top right"), pass `--title` on that same `point` so the title names both, and update the context too. A follow-up on the original thing ("still slow", "make it 15") leaves the title alone.
+  - **A point on an accepted item must come with a new title.** It reopens the item, and the title has to show why it is back, e.g. the old title plus the new symptom. `point` refuses without a changed `--title`, unless the user locked the title.
 - **Context (`--context`, required on `new`):** written for the user a week later, when they no longer remember what they meant. 3–5 plain sentences:
   - **where** in the product, and how to get there ("Home → tap any post → the row of buttons at the bottom");
   - **what was happening**: what they were doing and saw; if they pasted an image, say what it shows;
@@ -171,6 +176,7 @@ mana-track new --type bug --tag "Post page" --title "Post page: bottom bar bounc
     --context "On the post page (Home → tap any post). Opening someone else's post, the bottom bar collapses and bounces once more, which looks janky. The expand-and-bounce on your own posts was a deliberate choice and is out of scope."
 mana-track point 12 "still stutters, worse the second time"
 mana-track point 12 "the spacing here is off" --with-images
+mana-track point 12 "it's back, and it flickers on return" --title "…old title…, flickers again on return"   # required on an accepted item
 mana-track image 12 -p 1 --ref 4         # attach Claude Code's [Image #4] to point 1
 mana-track start 12 [-p 2]               # default: all open points; -p also takes a review point back
 mana-track review 12 -p 1 -p 2 --note "Opening someone else's post, the bar collapses once and no longer bounces. Not built." --file app/TabBar.swift
