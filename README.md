@@ -106,6 +106,10 @@ When the agent finishes, it hands the item over with a plain note: what changed,
 and what it did **not** verify. The card turns to **Review** and the Dock badge counts how many
 are waiting.
 
+Expand **Thread** on a card to see every point you raised, the screenshots you pasted, and the agent's note on what changed:
+
+![An expanded item](docs/images/thread-en.png)
+
 - **It works** → click **Accept** in the app, or tell the agent "accept #1".
 - **Still wrong** → tell the agent ("still covers it in landscape"). Your words become a new point
   and the old one goes back to Doing.

@@ -149,6 +149,13 @@ def main():
             for p in item['points']:
                 p['status'] = 'accepted'
             item['status'] = 'accepted'
+        if n == 1:
+            # The screenshot the user "pasted" with their first message (made-up, like everything here).
+            rel = 'attachments/0001/p1-demo-0.jpg'
+            os.makedirs(os.path.join(root, '.mana-tracker', 'attachments', '0001'), exist_ok=True)
+            shutil.copy(os.path.join(REPO, 'scripts', 'demo-assets', 'editor-keyboard.jpg'),
+                        os.path.join(root, '.mana-tracker', rel))
+            item['points'][0]['images'] = [rel]
         if ws:
             item['sessions'] = [{'agent': 'cc', 'id': f'demo-{n}', 'at': item['created_at'],
                                  'cwd': os.path.join(root, plat), 'workspace': {'id': f'demo-ws-{n}', 'title': ws}}]
