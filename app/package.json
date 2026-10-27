@@ -1,0 +1,55 @@
+{
+  "name": "mana-tracker",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Review and accept the bugs and requirements your coding agents record with mana-track",
+  "main": "dist/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node build.mjs && electron .",
+    "typecheck": "tsc --noEmit",
+    "dist": "node build.mjs && electron-builder --mac dir"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "lucide-react": "^1.55.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "productName": "Mana Tracker",
+  "build": {
+    "appId": "am.mana.tracker",
+    "productName": "Mana Tracker",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "package.json"
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dir"
+      ],
+      "identity": null,
+      "icon": "assets/icon.png"
+    },
+    "npmRebuild": false
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mana-am/agent-tracker"
+  }
+}

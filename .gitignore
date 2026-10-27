@@ -1,0 +1,6 @@
+node_modules/
+app/dist/
+app/release/
+__pycache__/
+.DS_Store
+.mana-tracker/

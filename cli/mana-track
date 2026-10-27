@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+"""mana-track — the requirement & bug list that Claude Code / Codex keep for you.
+
+Agents write through this CLI only; you review in the Mana Tracker app. An item is one thing
+you would verify as one thing (a bug or a requirement). It holds several *points*: your first
+description plus every follow-up on the same thing. Each point moves on its own:
+
+    open -> doing -> review -> accepted   (accepted = your sign-off)
+              ^         |
+              +---------+   you say "still wrong": your words become a new point,
+                            and the old point goes back with `start -p N`
+    dropped                 you withdrew it yourself (`drop --quote`)
+
+Sign-off belongs to you: you click 通过 / Accept in the app, or say it in the conversation —
+only then may the agent run `accept --quote "<your exact words>"`, and the CLI checks those
+words against your last messages in the session transcript. Priority only you change, in the app.
+
+Data lives in <project>/.mana-tracker/ (items/NNNN.json, attachments/, tags.json, skips.jsonl).
+"""
+import argparse
+import base64
+import difflib
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from project import DIRNAME, find_project, register  # noqa: E402
+
+PROJECT = None  # set in main()
+DATA = ITEMS = TAGS = ''
+
+STATUSES = ['open', 'doing', 'review', 'accepted', 'dropped']
+# An item shows the status of its point that most needs a hand. The app has the same rule
+# (app/src/shared/status.ts).
+PRECEDENCE = ['doing', 'open', 'review', 'accepted']
+CMUX = '/Applications/cmux.app/Contents/Resources/bin/cmux'
+
+
+def now():
+    return datetime.now().astimezone().isoformat(timespec='seconds')
+
+
+def actor():
+    if os.environ.get('CLAUDECODE'):
+        return 'cc', os.environ.get('CLAUDE_CODE_SESSION_ID', '')
+    if os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SANDBOX'):
+        return 'codex', os.environ.get('CODEX_THREAD_ID', '')
+    return 'agent', ''
+
+
+def derive_status(item):
+    live = [p['status'] for p in item['points'] if p['status'] != 'dropped']
+    if not live:
+        return 'dropped'
+    return next(s for s in PRECEDENCE if s in live)
+
+
+def path_of(item_id):
+    return os.path.join(ITEMS, f'{int(item_id):04d}.json')
+
+
+def load(item_id):
+    try:
+        with open(path_of(item_id)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit(f'No item #{item_id}')
+
+
+def load_all():
+    if not os.path.isdir(ITEMS):
+        return []
+    out = []
+    for name in sorted(os.listdir(ITEMS)):
+        if name.endswith('.json'):
+            with open(os.path.join(ITEMS, name)) as f:
+                item = json.load(f)
+            if 'merged_into' not in item:  # a merge redirect, not an item
+                out.append(item)
+    return out
+
+
+def write_json(path, data):
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+    os.replace(tmp, path)
+
+
+def save(item, created=False):
+    item['status'] = derive_status(item)
+    item['updated_at'] = now()
+    dest = path_of(item['id'])
+    if created:
+        # O_EXCL: when two sessions create at once, the later one takes the next id.
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, 'w') as f:
+            f.write(json.dumps(item, ensure_ascii=False, indent=2) + '\n')
+        return
+    write_json(dest, item)
+
+
+@contextmanager
+def locked():
+    os.makedirs(ITEMS, exist_ok=True)
+    with open(os.path.join(DATA, '.lock'), 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+# ---------- the conversation this command runs in ----------
+
+def cmux_workspace():
+    """The cmux workspace (id + title) this session runs in, or None outside cmux."""
+    ws_id = os.environ.get('CMUX_WORKSPACE_ID')
+    if not ws_id:
+        return None
+    title = ''
+    try:
+        out = subprocess.run([CMUX, 'tree', '--all', '--json'], capture_output=True, text=True, timeout=3).stdout
+        stack = [json.loads(out)]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                if node.get('id') == ws_id and 'title' in node:
+                    title = node['title'] or ''
+                    break
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {'id': ws_id, 'title': title}
+
+
+def touch_session(item):
+    """Remember the conversation working on this item, so the app can jump back into it."""
+    agent, sid = actor()
+    if not sid:
+        return
+    entry = next((s for s in item['sessions'] if s['id'] == sid), None)
+    if entry is None:
+        entry = {'agent': agent, 'id': sid, 'at': now()}
+        item['sessions'].append(entry)
+    entry['cwd'] = os.getcwd()
+    ws = cmux_workspace()
+    if ws:
+        entry['workspace'] = ws
+
+
+def transcript_path():
+    agent, sid = actor()
+    if not sid:
+        return None
+    if agent == 'cc':
+        hits = glob.glob(os.path.expanduser(f'~/.claude/projects/*/{sid}.jsonl'))
+    else:
+        hits = glob.glob(os.path.expanduser(f'~/.codex/sessions/*/*/*/*{sid}.jsonl'))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def transcript_messages():
+    """The user's own messages in this session, oldest first: [(text, [(label, ext, b64)])].
+    Includes messages typed while the agent was busy (cc stores those as queued_command)."""
+    path = transcript_path()
+    if not path:
+        sys.exit('Cannot find this session\'s transcript (only works inside Claude Code / Codex)')
+    out = []
+    for line in open(path, errors='replace'):
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        content = None
+        att = o.get('attachment') or {}
+        if o.get('type') == 'user' and not o.get('isMeta'):
+            content = o.get('message', {}).get('content')
+        elif o.get('type') == 'attachment' and att.get('type') == 'queued_command' \
+                and (att.get('origin') or {}).get('kind') == 'human':
+            content = att.get('prompt')
+        elif o.get('type') == 'response_item' and o.get('payload', {}).get('role') == 'user':
+            content = []
+            for c in o['payload'].get('content', []):
+                if c.get('type') == 'input_text':
+                    content.append({'type': 'text', 'text': c.get('text', '')})
+                elif c.get('type') == 'input_image':
+                    m = re.match(r'data:image/(\w+);base64,(.*)', c.get('image_url', ''), re.S)
+                    if m:
+                        content.append({'type': 'image', 'source': {
+                            'type': 'base64', 'media_type': f'image/{m.group(1)}', 'data': m.group(2)}})
+        if isinstance(content, str):
+            content = [{'type': 'text', 'text': content}]
+        if not isinstance(content, list):
+            continue
+        text = ' '.join(c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text')
+        labels = [int(n) for n in re.findall(r'\[Image #(\d+)\]', text)]
+        images = []
+        for c in content:
+            if isinstance(c, dict) and c.get('type') == 'image' and c.get('source', {}).get('type') == 'base64':
+                src = c['source']
+                images.append([None, src.get('media_type', 'image/png').split('/')[-1], src['data']])
+        for img, label in zip(images, labels):
+            img[0] = label
+        # Skip what the harness injects: <system-reminder>/<command-…> in cc,
+        # <environment_context> and the AGENTS.md dump in Codex; tool results carry no text.
+        injected = text.lstrip().startswith(('<', '# AGENTS.md instructions'))
+        if (text.strip() and not injected) or images:
+            out.append((text if not injected else '', images))
+    return out
+
+
+def user_images(messages_back=1, ref=None):
+    """Images the user pasted: by default every image in the latest message that had any;
+    ref=N picks the one cc labels [Image #N]. Returns [(ext, bytes)]."""
+    groups = [imgs for _, imgs in transcript_messages() if imgs]
+    if ref is not None:
+        picked = [i for g in groups for i in g if i[0] == ref]
+        if not picked:
+            sys.exit(f'No [Image #{ref}] in this session')
+    else:
+        if len(groups) < messages_back:
+            sys.exit('The user has not pasted an image in this session')
+        picked = groups[-messages_back]
+    return [('jpg' if ext == 'jpeg' else ext, base64.b64decode(data)) for _, ext, data in picked]
+
+
+def check_quote(quote):
+    """Sign-off is the user's: the quote must really be in one of their last three messages."""
+    squash = lambda t: re.sub(r'\s+', '', t)
+    q = squash(quote)
+    recent = [t for t, _ in transcript_messages() if t][-3:]
+    if len(q) < 2 or not any(q in squash(t) for t in recent):
+        sys.exit(f'"{quote}" is not in the user\'s last three messages. Only accept (or un-accept) when the '
+                 'user said so themselves, and copy their words verbatim into --quote. If they did not, do not '
+                 'accept for them — remind them they can click Accept in the Mana Tracker app.')
+
+
+def attach_images(item, point, images):
+    folder = os.path.join(DATA, 'attachments', f'{item["id"]:04d}')
+    os.makedirs(folder, exist_ok=True)
+    stamp = int(time.time() * 1000)
+    for n, (ext, data) in enumerate(images):
+        rel = f'attachments/{item["id"]:04d}/p{point["id"]}-{stamp}-{n}.{ext}'
+        with open(os.path.join(DATA, rel), 'wb') as f:
+            f.write(data)
+        point.setdefault('images', []).append(rel)
+
+
+def log(item, text):
+    item['log'].append({'at': now(), 'by': actor()[0], 'text': text})
+
+
+def pick_points(item, numbers, allowed):
+    if numbers:
+        by_id = {p['id']: p for p in item['points']}
+        missing = [n for n in numbers if n not in by_id]
+        if missing:
+            sys.exit(f'#{item["id"]} has no point {missing}')
+        return [by_id[n] for n in numbers]
+    return [p for p in item['points'] if p['status'] in allowed]
+
+
+def ids_of(points):
+    return ', '.join(str(p['id']) for p in points)
+
+
+# ---------- tags & platforms ----------
+
+def load_tags():
+    try:
+        with open(TAGS) as f:
+            return json.load(f)['tags']
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def save_tags(tags):
+    write_json(TAGS, {'tags': tags})
+
+
+def resolve_tags(names):
+    """Only tags already in tags.json (case-insensitive). Unknown ones fail with the closest
+    matches, so agents reuse tags instead of growing a long tail of near-duplicates."""
+    known = {t['name'].lower(): t['name'] for t in load_tags()}
+    out = []
+    for raw in names or []:
+        for name in [n.strip() for n in raw.split(',') if n.strip()]:
+            hit = known.get(name.lower())
+            if not hit:
+                near = difflib.get_close_matches(name.lower(), list(known), n=5, cutoff=0.3)
+                sys.exit(f'No tag "{name}". Use an existing one (`mana-track tags` lists them)'
+                         + (f'; closest: {", ".join(known[n] for n in near)}' if near else '')
+                         + f'. Only if none fits: mana-track tag-new "{name}" --desc "what it covers".')
+            if hit not in out:
+                out.append(hit)
+    return out
+
+
+def platform_names():
+    return [p['name'] for p in PROJECT.platforms]
+
+
+def resolve_platforms(given):
+    out = []
+    for raw in given or []:
+        for e in [x.strip() for x in raw.split(',') if x.strip()]:
+            hit = next((x for x in platform_names() if x.lower() == e.lower()), None)
+            if not hit:
+                sys.exit(f'No platform "{e}". This project has: {", ".join(platform_names()) or "(none configured)"}')
+            if hit not in out:
+                out.append(hit)
+    return out
+
+
+def default_platforms():
+    if not PROJECT.platforms:
+        return []
+    hit = PROJECT.platform_for(os.getcwd())
+    if hit:
+        return [hit]
+    if len(PROJECT.platforms) == 1:
+        return [PROJECT.platforms[0]['name']]
+    sys.exit('This session is not inside one platform\'s directory; say which with --platform: '
+             + ', '.join(platform_names()))
+
+
+def set_context(item, context):
+    if context and context != item.get('context'):
+        item['context'] = context
+        return True
+    return False
+
+
+def add_files(item, files):
+    for f in files or []:
+        if f not in item['files']:
+            item['files'].append(f)
+
+
+# ---------- commands ----------
+
+def cmd_init(a):
+    root = os.path.realpath(a.root or os.getcwd())
+    data = os.path.join(root, DIRNAME)
+    cfg_path = os.path.join(data, 'config.json')
+    os.makedirs(os.path.join(data, 'items'), exist_ok=True)
+    if os.path.exists(cfg_path):
+        print(f'Already initialised: {cfg_path}')
+    else:
+        platforms = []
+        for spec in a.platform or []:
+            name, _, dirs = spec.partition('=')
+            platforms.append({'name': name.strip(), 'dirs': [d.strip() for d in dirs.split(',') if d.strip()]})
+        cfg = {
+            'name': a.name or os.path.basename(root),
+            'scope': a.scope or 'Bugs and requirements for this product, on any platform. Not tracked: '
+                                 'marketing, data lookups, one-off questions, tooling for the agents themselves.',
+            'platforms': platforms,
+            'exclude': a.exclude or [],
+        }
+        write_json(cfg_path, cfg)
+        print(f'Created {cfg_path}')
+    gi = os.path.join(data, '.gitignore')
+    if not os.path.exists(gi):
+        # By default the list stays on this machine; --commit versions it with the code.
+        ignored = ['.lock', '*.tmp'] + ([] if a.commit else ['items/', 'attachments/', 'skips.jsonl', 'tags.json'])
+        with open(gi, 'w') as f:
+            f.write('\n'.join(ignored) + '\n')
+    if not os.path.exists(os.path.join(data, 'tags.json')):
+        write_json(os.path.join(data, 'tags.json'), {'tags': []})
+    register(root)
+    print(f'Registered {root} — the Mana Tracker app will list it.')
+
+
+def cmd_new(a):
+    with locked():
+        existing = [int(n[:4]) for n in os.listdir(ITEMS) if n.endswith('.json')]
+        at = now()
+        item = {
+            # Priority is the user's call, made in the app; everything starts at P1.
+            'id': max(existing, default=0) + 1, 'type': a.type, 'priority': 'P1',
+            'tags': resolve_tags(a.tag),
+            'platforms': resolve_platforms(a.platform) or default_platforms(),
+            'title': a.title, 'context': a.context,
+            'status': 'open',
+            'created_at': at, 'updated_at': at, 'created_by': actor()[0],
+            'points': [
+                {'id': i + 1, 'text': t, 'status': 'open', 'note': '', 'images': [],
+                 'created_at': at, 'updated_at': at}
+                for i, t in enumerate(a.point)
+            ],
+            'files': [], 'sessions': [], 'log': [],
+        }
+        add_files(item, a.file)
+        touch_session(item)
+        # Read the images before reserving an id, so a slow transcript read never holds a gap.
+        images = user_images() if a.with_images else []
+        log(item, f'created, {len(a.point)} point(s)' + (f', {len(images)} image(s)' if images else ''))
+        while True:
+            try:
+                save(item, created=True)
+                break
+            except FileExistsError:
+                item['id'] += 1
+        if images:
+            attach_images(item, item['points'][-1], images)
+            save(item)
+    print(f'#{item["id"]} created: {a.title}')
+
+
+def cmd_point(a):
+    with locked():
+        item = load(a.id)
+        at = now()
+        pid = max((p['id'] for p in item['points']), default=0) + 1
+        item['points'].append({'id': pid, 'text': a.text, 'status': 'open', 'note': '', 'images': [],
+                               'created_at': at, 'updated_at': at})
+        if a.with_images:
+            attach_images(item, item['points'][-1], user_images())
+        updated = set_context(item, a.context)
+        touch_session(item)
+        log(item, f'added point {pid}' + (' with images' if a.with_images else '')
+            + (', context updated' if updated else ''))
+        save(item)
+    print(f'#{a.id} point {pid} added')
+
+
+def set_points(a, target, allowed):
+    with locked():
+        item = load(a.id)
+        points = pick_points(item, a.point, allowed)
+        if not points:
+            sys.exit(f'#{a.id} has no point to move to {target} (pick one with -p)')
+        signed = [p['id'] for p in points if p['status'] == 'accepted']
+        if signed:
+            sys.exit(f'Point(s) {signed} are accepted by the user and cannot change. '
+                     'A new problem is a new point: mana-track point')
+        at = now()
+        for p in points:
+            p['status'] = target
+            p['updated_at'] = at
+            if target == 'review':
+                p['note'] = a.note
+        add_files(item, getattr(a, 'file', None))
+        set_context(item, getattr(a, 'context', None))
+        touch_session(item)
+        log(item, f'point(s) {ids_of(points)} -> {target}' + (f': {a.note}' if target == 'review' else ''))
+        save(item)
+    print(f'#{a.id} point(s) {ids_of(points)} -> {target}')
+
+
+def cmd_start(a):
+    set_points(a, 'doing', {'open'})  # -p can also take a review point back
+
+
+def cmd_review(a):
+    set_points(a, 'review', {'open', 'doing'})
+
+
+def cmd_image(a):
+    with locked():
+        item = load(a.id)
+        point = pick_points(item, [a.point], set())[0]
+        images = user_images(a.back, a.ref)
+        attach_images(item, point, images)
+        touch_session(item)
+        log(item, f'point {point["id"]}: attached {len(images)} image(s)')
+        save(item)
+    print(f'#{a.id} point {point["id"]}: attached {len(images)} image(s)')
+
+
+def cmd_drop(a):
+    with locked():
+        item = load(a.id)
+        points = pick_points(item, a.point, {'open', 'doing', 'review'})
+        at = now()
+        for p in points:
+            p['status'] = 'dropped'
+            p['updated_at'] = at
+        touch_session(item)
+        log(item, f'point(s) {ids_of(points)} -> dropped (user: "{a.quote}")')
+        save(item)
+    print(f'#{a.id} point(s) {ids_of(points)} dropped')
+
+
+def cmd_accept(a):
+    check_quote(a.quote)
+    with locked():
+        item = load(a.id)
+        points = pick_points(item, a.point, {'open', 'doing', 'review'})
+        if not points:
+            sys.exit(f'#{a.id} has nothing left to accept')
+        at = now()
+        for p in points:
+            p['status'] = 'accepted'
+            p['updated_at'] = at
+        touch_session(item)
+        log(item, f'point(s) {ids_of(points)} accepted (user said: "{a.quote}")')
+        save(item)
+    print(f'#{a.id} point(s) {ids_of(points)} accepted')
+
+
+def cmd_unaccept(a):
+    check_quote(a.quote)
+    with locked():
+        item = load(a.id)
+        points = pick_points(item, a.point, {'accepted'})
+        if not points:
+            sys.exit(f'#{a.id} has no accepted point')
+        at = now()
+        for p in points:
+            p['status'] = 'review'
+            p['updated_at'] = at
+        touch_session(item)
+        log(item, f'point(s) {ids_of(points)} un-accepted (user said: "{a.quote}")')
+        save(item)
+    print(f'#{a.id} point(s) {ids_of(points)} back to review')
+
+
+def cmd_note(a):
+    with locked():
+        item = load(a.id)
+        touch_session(item)
+        log(item, a.text)
+        save(item)
+    print(f'#{a.id} noted')
+
+
+def cmd_edit(a):
+    with locked():
+        item = load(a.id)
+        if a.title:
+            if item.get('title_locked'):
+                sys.exit(f'The user edited #{a.id}\'s title in the app; it is locked')
+            item['title'] = a.title
+        if a.type:
+            item['type'] = a.type
+        set_context(item, a.context)
+        if a.tag:
+            item['tags'] = resolve_tags(a.tag)
+        if a.platform:
+            item['platforms'] = resolve_platforms(a.platform)
+        if a.point_id is not None:
+            p = pick_points(item, [a.point_id], set())[0]
+            p['text'] = a.text
+            p['updated_at'] = now()
+        # Tidying is not working on it: do not attach this session, or "open conversation"
+        # in the app would jump to the tidying session instead of the one doing the work.
+        log(item, 'edited title/type/context/text')
+        save(item)
+    print(f'#{a.id} updated')
+
+
+def cmd_merge(a):
+    """Fold over-split items into one: points (with images, notes, status), files, sessions and
+    log move over. Each merged item leaves a redirect (merged_into + point map), so later
+    commands on the old id land on the new item."""
+    with locked():
+        target = load(a.target)
+        moved = []
+        for sid in a.sources:
+            if sid == a.target:
+                continue
+            src = load(sid)
+            point_map = {}
+            for p in src['points']:
+                new_id = max((x['id'] for x in target['points']), default=0) + 1
+                point_map[str(p['id'])] = new_id
+                target['points'].append(dict(p, id=new_id))
+            add_files(target, src['files'])
+            for key in ('tags', 'platforms'):
+                for t in src.get(key, []):
+                    if t not in target.setdefault(key, []):
+                        target[key].append(t)
+            for s in src['sessions']:
+                if not any(t['id'] == s['id'] for t in target['sessions']):
+                    target['sessions'].append(s)
+            for entry in src['log']:
+                target['log'].append(dict(entry, text=f'(was #{sid}) {entry["text"]}'))
+            if src.get('context') and not a.context:
+                target['context'] = (target.get('context', '') + f'\n(was #{sid}: {src["context"]})').strip()
+            write_json(path_of(sid), {'id': sid, 'merged_into': target['id'], 'point_map': point_map,
+                                      'title': src['title'], 'merged_at': now()})
+            moved.append(sid)
+        target['points'].sort(key=lambda p: p['created_at'])
+        if a.title and not target.get('title_locked'):
+            target['title'] = a.title
+        set_context(target, a.context)
+        log(target, f'merged #{", #".join(map(str, moved))} (same thing, split too fine)')
+        save(target)
+    print(f'Merged #{", #".join(map(str, moved))} into #{target["id"]}')
+
+
+def follow_merge(a):
+    """An id that was merged away: rewrite the command's item and point numbers."""
+    item_id = getattr(a, 'id', None)
+    if item_id is None or not os.path.exists(path_of(item_id)):
+        return
+    with open(path_of(item_id)) as f:
+        stub = json.load(f)
+    if 'merged_into' not in stub:
+        return
+    pm = stub['point_map']
+    if isinstance(getattr(a, 'point', None), list):
+        a.point = [pm.get(str(n), n) for n in a.point]
+    elif isinstance(getattr(a, 'point', None), int):
+        a.point = pm.get(str(a.point), a.point)
+    if getattr(a, 'point_id', None) is not None:
+        a.point_id = pm.get(str(a.point_id), a.point_id)
+    print(f'(#{item_id} was merged into #{stub["merged_into"]}; using that)', file=sys.stderr)
+    a.id = stub['merged_into']
+
+
+def cmd_tags(a):
+    counts = {}
+    for item in load_all():
+        for t in item.get('tags', []):
+            counts[t] = counts.get(t, 0) + 1
+    tags = load_tags()
+    if a.json:
+        print(json.dumps([dict(t, count=counts.get(t['name'], 0)) for t in tags], ensure_ascii=False, indent=2))
+        return
+    for t in sorted(tags, key=lambda t: -counts.get(t['name'], 0)):
+        print(f'{t["name"]:<16} {counts.get(t["name"], 0):>4}  {t.get("desc", "")}')
+    if not tags:
+        print('(no tags yet — create a few broad ones with tag-new)')
+
+
+def cmd_tag_new(a):
+    with locked():
+        tags = load_tags()
+        if any(t['name'].lower() == a.name.lower() for t in tags):
+            sys.exit(f'"{a.name}" exists already; use it')
+        near = difflib.get_close_matches(a.name.lower(), [t['name'].lower() for t in tags], n=3, cutoff=0.6)
+        if near and not a.force:
+            sys.exit(f'Very close to existing tag(s): {", ".join(near)}. Pass --force if it really is different')
+        tags.append({'name': a.name, 'desc': a.desc, 'created_at': now(), 'by': actor()[0]})
+        save_tags(tags)
+    print(f'Tag "{a.name}" created: {a.desc}')
+
+
+def retag_all(fn):
+    """Apply fn(tags) -> tags to every item. Tidying, so no session or status changes."""
+    n = 0
+    for name in sorted(os.listdir(ITEMS)):
+        if not name.endswith('.json'):
+            continue
+        path = os.path.join(ITEMS, name)
+        with open(path) as f:
+            item = json.load(f)
+        if 'merged_into' in item:
+            continue
+        old = item.get('tags', [])
+        new = []
+        for t in fn(old):
+            if t not in new:
+                new.append(t)
+        if new != old:
+            item['tags'] = new
+            write_json(path, item)
+            n += 1
+    return n
+
+
+def cmd_tag_merge(a):
+    with locked():
+        tags = load_tags()
+        if not any(t['name'] == a.into for t in tags):
+            if not a.desc:
+                sys.exit(f'"{a.into}" does not exist yet; say what it covers with --desc')
+            tags.append({'name': a.into, 'desc': a.desc, 'created_at': now(), 'by': actor()[0]})
+        elif a.desc:
+            next(t for t in tags if t['name'] == a.into)['desc'] = a.desc
+        save_tags([t for t in tags if t['name'] not in a.sources or t['name'] == a.into])
+        n = retag_all(lambda old: [a.into if t in a.sources else t for t in old])
+    print(f'{", ".join(a.sources)} -> {a.into}; {n} item(s) changed')
+
+
+def cmd_tag_drop(a):
+    with locked():
+        save_tags([t for t in load_tags() if t['name'] not in a.names])
+        n = retag_all(lambda old: [t for t in old if t not in a.names])
+    print(f'Dropped {", ".join(a.names)}; {n} item(s) changed')
+
+
+def cmd_skip(a):
+    # No item, but a record: every "this was not a requirement" goes to skips.jsonl so the user
+    # can audit the calls in the app. The hook takes this command as this turn's answer.
+    agent, sid = actor()
+    ws = cmux_workspace()
+    entry = {'at': now(), 'agent': agent, 'session': sid, 'reason': a.reason,
+             'workspace': (ws or {}).get('title', '')}
+    with locked():
+        with open(os.path.join(DATA, 'skips.jsonl'), 'a') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    print(f'Noted: no item this turn ({a.reason})')
+
+
+def fmt_line(item):
+    counts = {}
+    for p in item['points']:
+        counts[p['status']] = counts.get(p['status'], 0) + 1
+    detail = ' '.join(f'{s}:{n}' for s, n in counts.items()) if len(item['points']) > 1 else ''
+    tags = ','.join(item.get('platforms', []) + item.get('tags', []))
+    return (f'#{item["id"]:<4} [{item["status"]}] {item.get("priority", "P1")} {item["type"]} '
+            + (f'[{tags}] ' if tags else '') + item['title'] + (f'  ({detail})' if detail else ''))
+
+
+def cmd_list(a):
+    items = load_all()
+    if a.status:
+        items = [i for i in items if i['status'] in a.status]
+    elif not a.all:
+        items = [i for i in items if i['status'] not in ('accepted', 'dropped')]
+    if a.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+        return
+    for item in items:
+        print(fmt_line(item))
+    if not items:
+        print('(no items)')
+
+
+def cmd_show(a):
+    item = load(a.id)
+    if a.json:
+        print(json.dumps(item, ensure_ascii=False, indent=2))
+        return
+    print(fmt_line(item))
+    if item.get('context'):
+        print('\n  context:')
+        for line in item['context'].splitlines():
+            print(f'    {line}')
+    for p in item['points']:
+        print(f'\n  point {p["id"]} [{p["status"]}] {p["created_at"][:16]}')
+        for line in p['text'].splitlines():
+            print(f'    {line}')
+        for img in p['images']:
+            print(f'    image: {os.path.join(DATA, img)}')
+        if p['note']:
+            print(f'    change note: {p["note"]}')
+    if item['files']:
+        print('\n  files: ' + ', '.join(item['files']))
+    if item['sessions']:
+        print('  sessions: ' + ', '.join(
+            f'{s["agent"]} {s["id"]}' + (f' (cmux: {s["workspace"]["title"]})' if s.get('workspace', {}).get('title') else '')
+            for s in item['sessions']))
+    print('\n  log:')
+    for entry in item['log'][-12:]:
+        print(f'    {entry["at"][5:16]} {entry["by"]}: {entry["text"]}')
+
+
+def main():
+    global PROJECT, DATA, ITEMS, TAGS
+    ap = argparse.ArgumentParser(prog='mana-track', description='The requirement & bug list your coding agents keep for you')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    p = sub.add_parser('init', help='set up a project (run once, in its root directory)')
+    p.add_argument('--root', help='project root (default: current directory)')
+    p.add_argument('--name', help='display name (default: the directory name)')
+    p.add_argument('--scope', help='one line: what counts as a product bug / requirement here')
+    p.add_argument('--platform', action='append', metavar='NAME=DIR[,DIR]',
+                   help='a platform and the directories it lives in, e.g. iOS=ios  Server=server,workers')
+    p.add_argument('--exclude', action='append', metavar='DIR', help='directory (relative) whose sessions are out of scope')
+    p.add_argument('--commit', action='store_true', help='version the list with git instead of keeping it local')
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser('list', help='list items (default: the unfinished ones)')
+    p.add_argument('--all', action='store_true', help='include accepted and dropped')
+    p.add_argument('--status', nargs='+', choices=STATUSES)
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser('show', help='everything about one item')
+    p.add_argument('id', type=int)
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser('new', help='create an item')
+    p.add_argument('--type', required=True, choices=['bug', 'feature'])
+    p.add_argument('--title', required=True,
+                   help="in the user's language, short: where + what element + what happens / what they want")
+    p.add_argument('--point', required=True, action='append', help="the user's own words; repeat for several points")
+    p.add_argument('--platform', action='append',
+                   help='which platform(s); default: the one whose directory this session runs in')
+    p.add_argument('--tag', action='append', required=True,
+                   help='repeat or comma-separate; must already exist (see `tags`), tag-new only if none fits')
+    p.add_argument('--context', required=True,
+                   help='background for the user to recall it by: where in the product, what they were doing / '
+                        'saw, why it matters, what was decided')
+    p.add_argument('--file', action='append', help='related file, relative to the project root')
+    p.add_argument('--with-images', action='store_true', help="attach the images from the user's latest message")
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser('point', help='add a point to an item (a follow-up on the same thing)')
+    p.add_argument('id', type=int)
+    p.add_argument('text')
+    p.add_argument('--with-images', action='store_true', help="attach the images from the user's latest message")
+    p.add_argument('--context', help='full updated background, when a decision or direction changed')
+    p.set_defaults(fn=cmd_point)
+
+    p = sub.add_parser('image', help='attach images the user pasted earlier to a point')
+    p.add_argument('id', type=int)
+    p.add_argument('-p', '--point', type=int, required=True)
+    p.add_argument('--back', type=int, default=1, help='the Nth most recent user message with images (default 1)')
+    p.add_argument('--ref', type=int, help="Claude Code's [Image #N] label")
+    p.set_defaults(fn=cmd_image)
+
+    p = sub.add_parser('start', help='start work (default: all open points; -p can also take a review point back)')
+    p.add_argument('id', type=int)
+    p.add_argument('-p', '--point', type=int, action='append')
+    p.add_argument('--context', help='full updated background')
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser('review', help='done: hand it to the user to verify')
+    p.add_argument('id', type=int)
+    p.add_argument('-p', '--point', type=int, action='append')
+    p.add_argument('--note', required=True, help='what changed and how the user can check it, in plain words')
+    p.add_argument('--file', action='append', help='changed file, relative to the project root')
+    p.add_argument('--context', help='full updated background')
+    p.set_defaults(fn=cmd_review)
+
+    p = sub.add_parser('drop', help='the user withdrew it themselves (default: every point not accepted)')
+    p.add_argument('id', type=int)
+    p.add_argument('-p', '--point', type=int, action='append')
+    p.add_argument('--quote', required=True, help="the user's words withdrawing it")
+    p.set_defaults(fn=cmd_drop)
+
+    p = sub.add_parser('accept', help='the user said in the conversation that it passes (checked against the transcript)')
+    p.add_argument('id', type=int)
+    p.add_argument('-p', '--point', type=int, action='append')
+    p.add_argument('--quote', required=True, help="the user's words, verbatim, from one of their last three messages")
+    p.set_defaults(fn=cmd_accept)
+
+    p = sub.add_parser('unaccept', help='the user took a sign-off back (returns to review)')
+    p.add_argument('id', type=int)
+    p.add_argument('-p', '--point', type=int, action='append')
+    p.add_argument('--quote', required=True, help="the user's words, verbatim, from one of their last three messages")
+    p.set_defaults(fn=cmd_unaccept)
+
+    p = sub.add_parser('note', help='write a line in the log (progress, findings)')
+    p.add_argument('id', type=int)
+    p.add_argument('text')
+    p.set_defaults(fn=cmd_note)
+
+    p = sub.add_parser('edit', help="change title, type, tags, platforms, context, or a point's text")
+    p.add_argument('id', type=int)
+    p.add_argument('--title')
+    p.add_argument('--type', choices=['bug', 'feature'])
+    p.add_argument('--tag', action='append', help='replace the tags')
+    p.add_argument('--platform', action='append', help='replace the platforms')
+    p.add_argument('--context', help='full updated background')
+    p.add_argument('-p', '--point', dest='point_id', type=int, help='the point whose text to change')
+    p.add_argument('--text', help='with -p')
+    p.set_defaults(fn=cmd_edit)
+
+    p = sub.add_parser('merge', help='fold over-split items into one (old ids redirect)')
+    p.add_argument('target', type=int, help='the item to keep')
+    p.add_argument('sources', type=int, nargs='+', help='the items folded into it')
+    p.add_argument('--title', help='new title for the merged item')
+    p.add_argument('--context', help='full background for the merged item')
+    p.set_defaults(fn=cmd_merge)
+
+    p = sub.add_parser('tags', help='the tags in use, with counts')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_tags)
+
+    p = sub.add_parser('tag-new', help='create a tag (after checking none of the existing ones fit)')
+    p.add_argument('name')
+    p.add_argument('--desc', required=True, help='one line: what it covers')
+    p.add_argument('--force', action='store_true', help='it is close to an existing tag but really different')
+    p.set_defaults(fn=cmd_tag_new)
+
+    p = sub.add_parser('tag-merge', help='fold several tags into one, across all items')
+    p.add_argument('sources', nargs='+')
+    p.add_argument('--into', required=True)
+    p.add_argument('--desc', help='what the merged tag covers')
+    p.set_defaults(fn=cmd_tag_merge)
+
+    p = sub.add_parser('tag-drop', help='delete tags, removing them from every item')
+    p.add_argument('names', nargs='+')
+    p.set_defaults(fn=cmd_tag_drop)
+
+    p = sub.add_parser('skip', help="this turn's message was not a product bug / requirement; the reason is kept for audit")
+    p.add_argument('reason')
+    p.set_defaults(fn=cmd_skip)
+
+    a = ap.parse_args()
+    if a.cmd == 'edit' and (a.point_id is None) != (a.text is None):
+        ap.error('-p and --text go together')
+    if a.cmd != 'init':
+        PROJECT = find_project()
+        if PROJECT is None:
+            sys.exit('Not inside a Mana Tracker project (or inside an excluded directory). '
+                     'Run `mana-track init` in the project root first.')
+        DATA = PROJECT.dir
+        ITEMS = os.path.join(DATA, 'items')
+        TAGS = os.path.join(DATA, 'tags.json')
+        follow_merge(a)
+    a.fn(a)
+
+
+if __name__ == '__main__':
+    main()
