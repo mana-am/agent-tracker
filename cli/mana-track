@@ -25,6 +25,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -32,7 +33,7 @@ from contextlib import contextmanager
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from project import DIRNAME, find_project, register  # noqa: E402
+from project import DIRNAME, find_project, register, unregister  # noqa: E402
 
 PROJECT = None  # set in main()
 DATA = ITEMS = TAGS = ''
@@ -347,27 +348,54 @@ def add_files(item, files):
 
 # ---------- commands ----------
 
+DEFAULT_SCOPE = ('Bugs and requirements for this product, on any platform. Not tracked: marketing, '
+                 'data lookups, one-off questions, tooling for the agents themselves.')
+
+
+def parse_platforms(specs):
+    out = []
+    for spec in specs or []:
+        name, _, dirs = spec.partition('=')
+        if not name.strip():
+            sys.exit(f'Bad --platform "{spec}"; use NAME=DIR[,DIR]')
+        out.append({'name': name.strip(), 'dirs': [d.strip().rstrip('/') for d in dirs.split(',') if d.strip()]})
+    return out
+
+
+def describe(root, cfg):
+    lines = [f'Project: {cfg["name"]}  ({root})', f'Scope:   {cfg["scope"]}']
+    for p in cfg['platforms']:
+        lines.append(f'Platform {p["name"]}: {", ".join(p["dirs"]) or "(no directory)"}')
+    if cfg['exclude']:
+        lines.append(f'Excluded: {", ".join(cfg["exclude"])}')
+    return '\n'.join(lines)
+
+
 def cmd_init(a):
+    """Set up a project, or — run again — update its name / scope / platforms / exclusions."""
     root = os.path.realpath(a.root or os.getcwd())
+    outer = find_project(root)
+    if outer and outer.root != root and not a.force:
+        sys.exit(f'{root} is already inside the project at {outer.root}. Run init there to change it, '
+                 'or pass --force to start a separate project here.')
+    for flag, d in (('--platform', [s.partition('=')[2] for s in a.platform or []]), ('--exclude', a.exclude or [])):
+        for path in [x.strip() for spec in d for x in spec.split(',') if x.strip()]:
+            if not os.path.isdir(os.path.join(root, path)):
+                print(f'note: {flag} directory "{path}" does not exist (yet)', file=sys.stderr)
     data = os.path.join(root, DIRNAME)
     cfg_path = os.path.join(data, 'config.json')
     os.makedirs(os.path.join(data, 'items'), exist_ok=True)
-    if os.path.exists(cfg_path):
-        print(f'Already initialised: {cfg_path}')
-    else:
-        platforms = []
-        for spec in a.platform or []:
-            name, _, dirs = spec.partition('=')
-            platforms.append({'name': name.strip(), 'dirs': [d.strip() for d in dirs.split(',') if d.strip()]})
-        cfg = {
-            'name': a.name or os.path.basename(root),
-            'scope': a.scope or 'Bugs and requirements for this product, on any platform. Not tracked: '
-                                 'marketing, data lookups, one-off questions, tooling for the agents themselves.',
-            'platforms': platforms,
-            'exclude': a.exclude or [],
-        }
-        write_json(cfg_path, cfg)
-        print(f'Created {cfg_path}')
+    existed = os.path.exists(cfg_path)
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    cfg['name'] = a.name or cfg.get('name') or os.path.basename(root)
+    cfg['scope'] = a.scope or cfg.get('scope') or DEFAULT_SCOPE
+    cfg['platforms'] = parse_platforms(a.platform) if a.platform else cfg.get('platforms', [])
+    cfg['exclude'] = [e.rstrip('/') for e in a.exclude] if a.exclude else cfg.get('exclude', [])
+    write_json(cfg_path, cfg)
     gi = os.path.join(data, '.gitignore')
     if not os.path.exists(gi):
         # By default the list stays on this machine; --commit versions it with the code.
@@ -377,7 +405,43 @@ def cmd_init(a):
     if not os.path.exists(os.path.join(data, 'tags.json')):
         write_json(os.path.join(data, 'tags.json'), {'tags': []})
     register(root)
-    print(f'Registered {root} — the Mana Tracker app will list it.')
+    print(('Updated' if existed else 'Initialised') + f' {cfg_path}\n' + describe(root, cfg))
+    print('The Mana Tracker app lists it; the hooks now act in sessions under this directory.')
+
+
+def cmd_remove(a):
+    """Stop tracking this project. The list is kept (renamed aside) unless --delete-data."""
+    project = find_project()
+    if project is None:
+        sys.exit('Not inside a Mana Tracker project.')
+    unregister(project.root)
+    if a.delete_data:
+        shutil.rmtree(project.dir)
+        print(f'Removed {project.name}: unregistered and deleted {project.dir}')
+    else:
+        aside = f'{project.dir}.removed-{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        os.rename(project.dir, aside)
+        print(f'Removed {project.name}: unregistered; the list is kept at {aside} '
+              f'(rename it back to {DIRNAME} and run init to restore)')
+
+
+def cmd_uninstall(a):
+    """Remove the hooks, the skill links and the CLI link (and the app with --app). Lists stay."""
+    repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    subprocess.run([sys.executable, os.path.join(repo, 'hooks', 'install_hooks.py'), '--uninstall'], check=False)
+    links = [os.path.expanduser('~/.local/bin/mana-track'),
+             os.path.expanduser('~/.claude/skills/mana-tracker'),
+             os.path.expanduser('~/.agents/skills/mana-tracker')]
+    for link in links:
+        if os.path.islink(link) and os.path.realpath(link).startswith(repo + os.sep):
+            os.unlink(link)
+            print(f'removed {link}')
+    app = '/Applications/Mana Tracker.app'
+    if a.app and os.path.isdir(app):
+        shutil.rmtree(app)
+        print(f'removed {app}')
+    print('Uninstalled. Lists in each project\'s .mana-tracker/ are untouched'
+          + ('' if a.app else '; the app stays (add --app to remove it)') + '.')
 
 
 def cmd_new(a):
@@ -763,7 +827,7 @@ def main():
     ap = argparse.ArgumentParser(prog='mana-track', description='The requirement & bug list your coding agents keep for you')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
-    p = sub.add_parser('init', help='set up a project (run once, in its root directory)')
+    p = sub.add_parser('init', help='set up a project in its root directory; run again to change its settings')
     p.add_argument('--root', help='project root (default: current directory)')
     p.add_argument('--name', help='display name (default: the directory name)')
     p.add_argument('--scope', help='one line: what counts as a product bug / requirement here')
@@ -771,7 +835,16 @@ def main():
                    help='a platform and the directories it lives in, e.g. iOS=ios  Server=server,workers')
     p.add_argument('--exclude', action='append', metavar='DIR', help='directory (relative) whose sessions are out of scope')
     p.add_argument('--commit', action='store_true', help='version the list with git instead of keeping it local')
+    p.add_argument('--force', action='store_true', help='start a separate project inside an existing one')
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser('remove', help='stop tracking this project (the list is kept aside unless --delete-data)')
+    p.add_argument('--delete-data', action='store_true', help='also delete the list, images and tags for good')
+    p.set_defaults(fn=cmd_remove)
+
+    p = sub.add_parser('uninstall', help='remove the hooks, skill and CLI from this machine (lists stay)')
+    p.add_argument('--app', action='store_true', help='also delete /Applications/Mana Tracker.app')
+    p.set_defaults(fn=cmd_uninstall)
 
     p = sub.add_parser('list', help='list items (default: the unfinished ones)')
     p.add_argument('--all', action='store_true', help='include accepted and dropped')
@@ -896,7 +969,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == 'edit' and (a.point_id is None) != (a.text is None):
         ap.error('-p and --text go together')
-    if a.cmd != 'init':
+    if a.cmd not in ('init', 'remove', 'uninstall'):
         PROJECT = find_project()
         if PROJECT is None:
             sys.exit('Not inside a Mana Tracker project (or inside an excluded directory). '

@@ -62,11 +62,37 @@ a `.bak-mana-tracker` copy), and builds the app into `/Applications`. It is safe
 The hooks are installed at user level but only act inside projects you set up, so other work is
 untouched.
 
+## With cmux (recommended)
+
+[cmux](https://github.com/manaflow-ai/cmux) is a macOS terminal built for running many coding-agent
+sessions side by side, each in its own named workspace. Mana Tracker works without it, but the two
+fit together:
+
+- **Every item remembers its workspace.** When the agent records or updates an item inside cmux,
+  the workspace's id and name are saved with it, and the card shows that name.
+- **Open conversation jumps straight there.** If the workspace is still open, the app switches cmux
+  to it. If you closed it, the app opens a new workspace that resumes the same Claude Code / Codex
+  session, with the same launch command it was started with.
+- **Search finds items by workspace name**, including names you gave the workspace later.
+
+Without cmux, **Open conversation** opens a Terminal window in the directory the agent worked in
+and resumes the session there (`claude --resume …` / `codex resume …`).
+
 ## Tutorial
 
 ### 1. Set up a project
 
-In your project's root directory:
+Open Claude Code or Codex in your project's root and say:
+
+> set up the tracker here
+
+The agent reads the repository and decides the settings itself: the product's name, its
+platforms (which directories are the iOS app, the web app, the server…), the directories to
+ignore (scratch areas, generated code), a one-line scope, and a handful of starting tags. Then it
+tells you what it chose. To change something later, just say so ("treat workers as part of the
+server", "ignore the playground folder").
+
+Prefer to do it by hand? It is one command:
 
 ```bash
 mana-track init --name "Pocket Notes" \
@@ -74,15 +100,14 @@ mana-track init --name "Pocket Notes" \
     --exclude playground
 ```
 
-- `--platform NAME=DIR[,DIR]` (optional): which part of the product each directory is. An item
-  gets the platform of the directory the agent works in; the app filters by it.
-- `--exclude DIR` (optional): sessions under it are out of scope (scratch areas, generated code).
-- `--scope "…"` (optional): one line telling the agent what counts. The default: product bugs and
-  requirements, not marketing, data lookups or agent tooling.
-- `--commit`: version the list with git. By default it stays on this machine (`.mana-tracker/.gitignore`).
+| Option | Meaning |
+|---|---|
+| `--platform NAME=DIR[,DIR]` | Which part of the product each directory is. An item gets the platform of the directory the agent works in, and the app filters by it. Optional. |
+| `--exclude DIR` | Sessions under it are out of scope. Optional. |
+| `--scope "…"` | One line telling the agent what counts. Default: product bugs and requirements, not marketing, data lookups or agent tooling. |
+| `--commit` | Version the list with git. By default it stays on this machine. |
 
-This creates `.mana-tracker/` and registers the project with the app. Edit
-`.mana-tracker/config.json` any time.
+Run `init` again with new options to change the settings; it keeps the rest.
 
 ### 2. Work as usual
 
@@ -143,6 +168,7 @@ mana-track drop 12 -p 3 --quote "the user's exact words"
 mana-track merge 28 29 30            # fold over-split items; old ids redirect
 mana-track tags | tag-new | tag-merge | tag-drop
 mana-track skip "why this turn had no requirement"
+mana-track init | remove | uninstall
 ```
 
 ## Data
@@ -171,12 +197,18 @@ watches the folder and updates live.
 
 ## Uninstall
 
+You can ask the agent ("stop using the tracker in this project", "uninstall the tracker"), or run
+the commands yourself:
+
 ```bash
-./uninstall.sh
+mana-track remove                  # this project only: stop tracking, keep the list aside
+mana-track remove --delete-data    # this project only: also delete the list for good
+mana-track uninstall               # this machine: hooks, skill and CLI (every project); lists stay
+mana-track uninstall --app         # …and delete the app too
 ```
 
-Removes the CLI, skill links and hook entries. Your lists in each project's `.mana-tracker/` and
-the app stay; delete them yourself if you like.
+`remove` moves the list to `.mana-tracker.removed-<date>`; rename it back and run `init` to
+restore. `./uninstall.sh` in the repository does the same as `mana-track uninstall`.
 
 ## License
 

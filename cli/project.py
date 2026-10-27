@@ -68,17 +68,32 @@ def find_project(path=None):
     return None
 
 
-def register(root):
-    os.makedirs(HOME, exist_ok=True)
+def _read_registry():
     try:
         with open(REGISTRY) as f:
-            data = json.load(f)
+            return json.load(f)
     except (OSError, ValueError):
-        data = {'projects': []}
-    root = os.path.realpath(root)
-    if not any(p.get('root') == root for p in data['projects']):
-        data['projects'].append({'root': root})
+        return {'projects': []}
+
+
+def _write_registry(data):
+    os.makedirs(HOME, exist_ok=True)
     tmp = f'{REGISTRY}.{os.getpid()}.tmp'
     with open(tmp, 'w') as f:
         f.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
     os.replace(tmp, REGISTRY)
+
+
+def unregister(root):
+    data = _read_registry()
+    root = os.path.realpath(root)
+    data['projects'] = [p for p in data['projects'] if p.get('root') != root]
+    _write_registry(data)
+
+
+def register(root):
+    data = _read_registry()
+    root = os.path.realpath(root)
+    if not any(p.get('root') == root for p in data['projects']):
+        data['projects'].append({'root': root})
+    _write_registry(data)

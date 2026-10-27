@@ -62,11 +62,33 @@ cd agent-tracker
 
 hook 装在用户级别，但只在你初始化过的项目里起作用，不影响别的工作。
 
+## 配合 cmux 使用（推荐）
+
+[cmux](https://github.com/manaflow-ai/cmux) 是一个 macOS 终端，专门用来同时跑很多个 coding agent 会话，
+每个会话在自己有名字的工作区里。不装 cmux 也能用 Mana Tracker，但两者配合起来最顺手：
+
+- **每一条都记得自己的工作区。** agent 在 cmux 里记录或更新条目时，会把当前工作区的编号和名字一起存下来，
+  卡片上就显示这个名字。
+- **「打开对话」直接跳过去。** 工作区还开着，应用就把 cmux 切到那个工作区；已经关掉了，应用会新开一个工作区，
+  用当初启动它的同一条命令，接着原来的 Claude Code / Codex 会话往下聊。
+- **能按工作区名字搜到条目**，你后来给工作区改的名字也能搜。
+
+没装 cmux 时，「打开对话」会在 agent 当时干活的目录里开一个终端窗口，接着那个会话聊
+（`claude --resume …` / `codex resume …`）。
+
 ## 使用教程
 
 ### 1. 初始化项目
 
-在项目根目录运行：
+在项目根目录打开 Claude Code 或 Codex，说一句：
+
+> 初始化 tracker
+
+agent 会先读一遍仓库，自己定好设置：产品叫什么、分哪几端（哪个目录是 iOS、哪个是网页、哪个是服务器……）、
+哪些目录不用管（草稿区、生成的代码）、一句话的记录范围，再建几个常用标签。定完会告诉你它是怎么定的。以后想改，
+直接跟它说就行（「workers 也算服务器」「playground 目录别管」）。
+
+想自己动手也行，就一条命令：
 
 ```bash
 mana-track init --name "口袋笔记" \
@@ -74,14 +96,14 @@ mana-track init --name "口袋笔记" \
     --exclude playground
 ```
 
-- `--platform 名字=目录[,目录]`（可选）：说明每个目录属于产品的哪一端。agent 在哪个目录干活，新条目就标哪一端，
-  应用里可以按端筛选。
-- `--exclude 目录`（可选）：这个目录下的会话不算，比如草稿区、生成的代码。
-- `--scope "……"`（可选）：用一句话告诉 agent 什么算需求。默认是产品的 bug 和需求，不包括营销、查数据、给
-  agent 用的工具。
-- `--commit`：清单跟着代码一起进 git。默认只留在本机（写在 `.mana-tracker/.gitignore` 里）。
+| 参数 | 意思 |
+|---|---|
+| `--platform 名字=目录[,目录]` | 每个目录属于产品的哪一端。agent 在哪个目录干活，新条目就标哪一端，应用里可以按端筛选。可不填。 |
+| `--exclude 目录` | 这个目录下的会话不算。可不填。 |
+| `--scope "……"` | 用一句话告诉 agent 什么算需求。默认是产品的 bug 和需求，不包括营销、查数据、给 agent 用的工具。 |
+| `--commit` | 清单跟着代码一起进 git。默认只留在本机。 |
 
-这一步会建好 `.mana-tracker/`，并把项目登记到应用里。之后随时可以改 `.mana-tracker/config.json`。
+想改设置，带上新参数再运行一次 `init`，没提到的设置保持不变。
 
 ### 2. 照常干活
 
@@ -139,6 +161,7 @@ mana-track drop 12 -p 3 --quote "用户原话"
 mana-track merge 28 29 30            # 拆细了就合；旧编号自动转到新的
 mana-track tags | tag-new | tag-merge | tag-drop
 mana-track skip "这一轮为什么没有需求"
+mana-track init | remove | uninstall
 ```
 
 ## 数据
@@ -164,11 +187,17 @@ skips.jsonl        每一次「不是需求」和它的理由
 
 ## 卸载
 
+可以直接跟 agent 说（「这个项目不用 tracker 了」「卸载 tracker」），也可以自己运行：
+
 ```bash
-./uninstall.sh
+mana-track remove                  # 只针对当前项目：不再记录，清单挪到一边保留
+mana-track remove --delete-data    # 只针对当前项目：连清单一起彻底删掉
+mana-track uninstall               # 整台电脑：删掉 hook、skill 和命令行（所有项目都停用），清单保留
+mana-track uninstall --app         # ……连应用一起删
 ```
 
-会删掉命令行、skill 链接和 hook 配置。每个项目里 `.mana-tracker/` 中的清单和应用都会保留，不想要可以自己删。
+`remove` 会把清单挪到 `.mana-tracker.removed-<日期>`，改回 `.mana-tracker` 再运行一次 `init` 就能恢复。
+仓库里的 `./uninstall.sh` 和 `mana-track uninstall` 是一样的。
 
 ## 许可证
 

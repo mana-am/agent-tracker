@@ -1,6 +1,6 @@
 ---
 name: mana-tracker
-description: "Keep the user's requirement & bug list with the `mana-track` CLI: record every product bug or requirement the user raises, keep each item's status current, and hand finished work back for the user to verify in the Mana Tracker app. Use WHENEVER, inside a project that has a `.mana-tracker/` directory, the user reports a problem (it's slow / wrong / broken / flickers / why does…), asks for a change or feature (change X to Y / add / remove / can we…), follows up on an earlier one (still broken / also / no, it should… / never mind), or when you are about to start or finish product code changes. Covers how to split one message that holds several problems, when a follow-up is a new point on an old item, which messages are not points at all, tags, platforms and status rules. Only the user signs items off and sets priority. SKIP whatever the project's scope line excludes (shown at session start)."
+description: "Keep the user's requirement & bug list with the `mana-track` CLI: set it up for a project when asked ('set up / init the tracker', '初始化 tracker'), take it off a project or the machine ('remove / uninstall the tracker', '卸载 tracker'), record every product bug or requirement the user raises, keep each item's status current, and hand finished work back for the user to verify in the Mana Tracker app. Use WHENEVER, inside a project that has a `.mana-tracker/` directory, the user reports a problem (it's slow / wrong / broken / flickers / why does…), asks for a change or feature (change X to Y / add / remove / can we…), follows up on an earlier one (still broken / also / no, it should… / never mind), or when you are about to start or finish product code changes. Covers how to split one message that holds several problems, when a follow-up is a new point on an old item, which messages are not points at all, tags, platforms and status rules. Only the user signs items off and sets priority. SKIP whatever the project's scope line excludes (shown at session start)."
 ---
 
 # The requirement & bug list
@@ -15,6 +15,49 @@ The command is `mana-track` (on PATH). Never edit files under `.mana-tracker/ite
 `attachments/` directly; the hook refuses it.
 
 **Language:** write titles, points, context and notes in the language the user writes in.
+
+## Setting up, changing, removing
+
+**"Set up the tracker here" / 「初始化 tracker」.** Do it yourself — the user should not have to work
+out the flags. Then tell them what you chose.
+
+1. **Find the root.** Usually the repository root (or the directory the user names). If
+   `mana-track init` says it is already inside another project, tell the user rather than forcing.
+2. **Read the layout** before deciding: the top-level directories, the README, and the build
+   manifests (`package.json`, `*.xcodeproj` / `Package.swift`, `build.gradle`, `go.mod`, `pyproject.toml`…).
+3. **Decide the settings:**
+   - `--name`: the product's name as users know it (from the README / app config), not the folder name.
+   - `--platform NAME=DIR[,DIR]`: one per part of the product a user would name — iOS app, Android
+     app, web app, admin console, server. Put the directories of one part together
+     (`Server=server,workers`). Skip libraries, tooling, docs. Name them in the user's language.
+     A single-app repo needs no platforms.
+   - `--exclude DIR`: places where sessions do non-product work — scratch / playground,
+     generated or vendored code, examples, sandboxes where agents build other things.
+   - `--scope "…"`: one line saying what counts and what doesn't, in the user's language, e.g.
+     "Bugs and requirements for Pocket Notes on any platform. Not: marketing, data lookups, tooling."
+   - `--commit` only if the user wants the list versioned with the code; by default it stays local.
+4. **Run** `mana-track init …` from the root.
+5. **Seed 5–10 broad tags** with `tag-new`: the product's main areas as a user would name them
+   (read the navigation / routes / tab definitions — Home, Editor, Settings, Account…), plus one or
+   two kinds (Performance, Localisation). In the user's language.
+6. **Report in plain words:** name, platforms with their directories, what is excluded, the scope
+   line, the tags; that the list stays on this machine; that the Mana Tracker app now lists it;
+   and that they can say "change the tracker settings" any time. It applies from the next
+   message on, in every session under that directory.
+
+Only stop to ask when the repository is genuinely ambiguous (several unrelated products in one repo).
+
+**"Change the tracker settings".** Run `init` again with just the flags that change — it keeps the
+rest (`--platform` / `--exclude` replace the whole list, so pass all of them). Report the result.
+
+**"Stop using the tracker in this project".** `mana-track remove` — unregisters it and moves the
+list aside as `.mana-tracker.removed-<date>` (rename it back and run `init` to restore). Delete the
+list for good (`remove --delete-data`) only when the user explicitly asks to delete it, and confirm
+first: it cannot be undone.
+
+**"Uninstall the tracker" / 「卸载 tracker」.** `mana-track uninstall` removes the hooks, the skill and
+the CLI from this machine — for **every** project, so say that. Lists stay in each project. Add
+`--app` only if they also want the Mana Tracker app deleted.
 
 ## The data
 
@@ -138,6 +181,10 @@ mana-track unaccept 12 --quote "un-accept #12, it broke"   # the user took it ba
 mana-track edit 12 --title "…" | --context "full updated context" | -p 2 --text "…"
 mana-track merge 28 29 30 --title "…" --context "…"        # fold over-split items; old ids redirect
 mana-track skip "only changed the build script"
+
+mana-track init --name "Pocket Notes" --platform iOS=ios --platform Web=web --exclude playground
+mana-track remove [--delete-data]          # this project only
+mana-track uninstall [--app]               # the whole machine
 ```
 
 ## Don't
